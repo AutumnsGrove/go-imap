@@ -24,6 +24,24 @@ type Mailbox struct {
 	specialUse []imap.MailboxAttr
 	l          []*message
 	uidNext    imap.UID
+
+	highestModSeq uint64
+	expunged      []expungedMessage
+}
+
+// expungedMessage records a UID removed from the mailbox and the mod-sequence
+// at which it vanished, so a QRESYNC SELECT can report it as VANISHED
+// (EARLIER) (RFC 7162 section 3.2).
+type expungedMessage struct {
+	uid    imap.UID
+	modSeq uint64
+}
+
+// nextModSeqLocked advances and returns the mailbox mod-sequence. Callers must
+// hold mbox.mutex.
+func (mbox *Mailbox) nextModSeqLocked() uint64 {
+	mbox.highestModSeq++
+	return mbox.highestModSeq
 }
 
 // NewMailbox creates a new mailbox.
@@ -98,6 +116,9 @@ func (mbox *Mailbox) statusDataLocked(options *imap.StatusOptions) *imap.StatusD
 		num := uint32(0)
 		data.NumRecent = &num
 	}
+	if options.HighestModSeq {
+		data.HighestModSeq = mbox.highestModSeq
+	}
 	return &data
 }
 
@@ -155,6 +176,7 @@ func (mbox *Mailbox) appendBytes(buf []byte, options *imap.AppendOptions) *imap.
 
 	msg.uid = mbox.uidNext
 	mbox.uidNext++
+	msg.modSeq = mbox.nextModSeqLocked()
 
 	mbox.l = append(mbox.l, msg)
 	mbox.tracker.QueueNumMessages(uint32(len(mbox.l)))
@@ -178,7 +200,7 @@ func (mbox *Mailbox) SetSubscribed(subscribed bool) {
 	mbox.mutex.Unlock()
 }
 
-func (mbox *Mailbox) selectDataLocked() *imap.SelectData {
+func (mbox *Mailbox) selectDataLocked(options *imap.SelectOptions) *imap.SelectData {
 	flags := mbox.flagsLocked()
 
 	permanentFlags := make([]imap.Flag, len(flags))
@@ -189,14 +211,31 @@ func (mbox *Mailbox) selectDataLocked() *imap.SelectData {
 	// enabled by the client
 	firstUnseenSeqNum := mbox.firstUnseenSeqNumLocked()
 
-	return &imap.SelectData{
+	data := &imap.SelectData{
 		Flags:             flags,
 		PermanentFlags:    permanentFlags,
 		NumMessages:       uint32(len(mbox.l)),
 		FirstUnseenSeqNum: firstUnseenSeqNum,
 		UIDNext:           mbox.uidNext,
 		UIDValidity:       mbox.uidValidity,
+		HighestModSeq:     mbox.highestModSeq,
 	}
+
+	// QRESYNC SELECT (RFC 7162 section 3.2): report every UID expunged since
+	// the client's last known mod-sequence, but only if the client's
+	// UIDVALIDITY still matches this mailbox. A mismatch means the mailbox was
+	// rebuilt and the client must resynchronise from scratch.
+	if options != nil && options.QResync != nil && options.QResync.UIDValidity == mbox.uidValidity {
+		var vanished imap.UIDSet
+		for _, ex := range mbox.expunged {
+			if ex.modSeq > options.QResync.ModSeq {
+				vanished.AddNum(ex.uid)
+			}
+		}
+		data.Vanished = vanished
+	}
+
+	return data
 }
 
 func (mbox *Mailbox) firstUnseenSeqNumLocked() uint32 {
@@ -263,7 +302,8 @@ func (mbox *Mailbox) expungeLocked(expunged map[*message]struct{}) (seqNums []ui
 		if _, ok := expunged[msg]; ok {
 			seqNum := uint32(i) + 1
 			seqNums = append(seqNums, seqNum)
-			mbox.tracker.QueueExpunge(seqNum)
+			mbox.expunged = append(mbox.expunged, expungedMessage{uid: msg.uid, modSeq: mbox.nextModSeqLocked()})
+			mbox.tracker.QueueExpungeWithUID(seqNum, msg.uid)
 		} else {
 			filtered = append(filtered, msg)
 		}
@@ -318,14 +358,27 @@ func (mbox *MailboxView) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, op
 		}
 	}
 
+	if options.Vanished {
+		if err := mbox.writeVanished(w, numSet, options.ChangedSince); err != nil {
+			return err
+		}
+	}
+
 	var err error
 	mbox.forEach(numSet, func(seqNum uint32, msg *message) {
 		if err != nil {
 			return
 		}
+		// CONDSTORE: skip messages older than the requested floor
+		// (RFC 7162 section 3.1.4).
+		if options.ChangedSince != 0 && msg.modSeq <= options.ChangedSince {
+			return
+		}
 
 		if markSeen {
-			msg.flags[canonicalFlag(imap.FlagSeen)] = struct{}{}
+			if msg.store(&imap.StoreFlags{Op: imap.StoreFlagsAdd, Flags: []imap.Flag{imap.FlagSeen}}) {
+				msg.modSeq = mbox.Mailbox.nextModSeqLocked()
+			}
 			mbox.Mailbox.tracker.QueueMessageFlags(seqNum, msg.uid, msg.flagList(), nil)
 		}
 
@@ -333,6 +386,31 @@ func (mbox *MailboxView) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, op
 		err = msg.fetch(respWriter, options)
 	})
 	return err
+}
+
+// writeVanished reports the UIDs in numSet expunged since modSeq, as the
+// VANISHED (EARLIER) response to UID FETCH (CHANGEDSINCE n VANISHED)
+// (RFC 7162 section 3.2.10).
+func (mbox *MailboxView) writeVanished(w *imapserver.FetchWriter, numSet imap.NumSet, modSeq uint64) error {
+	uids, _ := numSet.(imap.UIDSet)
+
+	var vanished imap.UIDSet
+	mbox.mutex.Lock()
+	for _, ex := range mbox.expunged {
+		if ex.modSeq <= modSeq {
+			continue
+		}
+		if uids != nil && !uids.Contains(ex.uid) {
+			continue
+		}
+		vanished.AddNum(ex.uid)
+	}
+	mbox.mutex.Unlock()
+
+	if len(vanished) == 0 {
+		return nil
+	}
+	return w.WriteVanished(vanished)
 }
 
 func (mbox *MailboxView) Search(numKind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error) {
@@ -418,12 +496,32 @@ func (mbox *MailboxView) staticSearchCriteria(criteria *imap.SearchCriteria) {
 }
 
 func (mbox *MailboxView) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
+	var accepted, refused imap.UIDSet
 	mbox.forEach(numSet, func(seqNum uint32, msg *message) {
-		msg.store(flags)
-		mbox.Mailbox.tracker.QueueMessageFlags(seqNum, msg.uid, msg.flagList(), mbox.tracker)
+		// CONDSTORE UNCHANGEDSINCE (RFC 7162 section 3.1.3): refuse to
+		// overwrite a message that has changed since the client's floor.
+		if options.UnchangedSince != 0 && msg.modSeq > options.UnchangedSince {
+			refused.AddNum(msg.uid)
+			return
+		}
+		if msg.store(flags) {
+			msg.modSeq = mbox.Mailbox.nextModSeqLocked()
+			mbox.Mailbox.tracker.QueueMessageFlags(seqNum, msg.uid, msg.flagList(), mbox.tracker)
+		}
+		accepted.AddNum(msg.uid)
 	})
+
 	if !flags.Silent {
-		return mbox.Fetch(w, numSet, &imap.FetchOptions{Flags: true})
+		if err := mbox.Fetch(w, accepted, &imap.FetchOptions{Flags: true, UID: true}); err != nil {
+			return err
+		}
+	}
+	if len(refused) > 0 {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeOK,
+			Code: imap.ResponseCode(string(imap.ResponseCodeModified) + " " + refused.String()),
+			Text: "Some messages were modified",
+		}
 	}
 	return nil
 }

@@ -22,11 +22,15 @@ type message struct {
 	t   time.Time
 
 	// mutable, protected by Mailbox.mutex
-	flags map[imap.Flag]struct{}
+	flags  map[imap.Flag]struct{}
+	modSeq uint64
 }
 
 func (msg *message) fetch(w *imapserver.FetchResponseWriter, options *imap.FetchOptions) error {
 	w.WriteUID(msg.uid)
+	if options.ModSeq {
+		w.WriteModSeq(msg.modSeq)
+	}
 
 	if options.Flags {
 		w.WriteFlags(msg.flagList())
@@ -95,7 +99,14 @@ func (msg *message) flagList() []imap.Flag {
 	return flags
 }
 
-func (msg *message) store(store *imap.StoreFlags) {
+// store applies a flag change and reports whether the flags actually changed,
+// so callers only advance the mod-sequence on a real change.
+func (msg *message) store(store *imap.StoreFlags) bool {
+	before := make(map[imap.Flag]struct{}, len(msg.flags))
+	for flag := range msg.flags {
+		before[flag] = struct{}{}
+	}
+
 	switch store.Op {
 	case imap.StoreFlagsSet:
 		msg.flags = make(map[imap.Flag]struct{})
@@ -111,6 +122,16 @@ func (msg *message) store(store *imap.StoreFlags) {
 	default:
 		panic(fmt.Errorf("unknown STORE flag operation: %v", store.Op))
 	}
+
+	if len(before) != len(msg.flags) {
+		return true
+	}
+	for flag := range before {
+		if _, ok := msg.flags[flag]; !ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (msg *message) reader() *gomessage.Entity {

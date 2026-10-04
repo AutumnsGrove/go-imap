@@ -3,6 +3,7 @@ package imapmemserver
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -53,11 +54,12 @@ func (msg *message) fetch(w *imapserver.FetchResponseWriter, options *imap.Fetch
 		wc := w.WriteBodySection(bs, int64(len(buf)))
 		_, writeErr := wc.Write(buf)
 		closeErr := wc.Close()
-		if writeErr != nil {
-			return writeErr
-		}
-		if closeErr != nil {
-			return closeErr
+		if writeErr != nil || closeErr != nil {
+			// Close the response even though the connection is failing: it releases
+			// the connection's encoder lock, which the serve loop needs to write the
+			// tagged status response.
+			_ = w.Close()
+			return errors.Join(writeErr, closeErr)
 		}
 	}
 
@@ -66,11 +68,12 @@ func (msg *message) fetch(w *imapserver.FetchResponseWriter, options *imap.Fetch
 		wc := w.WriteBinarySection(bs, int64(len(buf)))
 		_, writeErr := wc.Write(buf)
 		closeErr := wc.Close()
-		if writeErr != nil {
-			return writeErr
-		}
-		if closeErr != nil {
-			return closeErr
+		if writeErr != nil || closeErr != nil {
+			// Close the response even though the connection is failing: it releases
+			// the connection's encoder lock, which the serve loop needs to write the
+			// tagged status response.
+			_ = w.Close()
+			return errors.Join(writeErr, closeErr)
 		}
 	}
 
